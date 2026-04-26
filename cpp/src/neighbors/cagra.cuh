@@ -89,7 +89,7 @@ void build_knn_graph(
 
   auto knn_graph_internal = raft::make_host_matrix_view<internal_IdxT, int64_t>(
     reinterpret_cast<internal_IdxT*>(knn_graph.data_handle()),
-    knn_graph.extent(0),
+    knn_graph.extent(0), // extent --> 
     knn_graph.extent(1));
   auto dataset_internal =
     raft::mdspan<const DataT, raft::matrix_extent<int64_t>, raft::row_major, accessor>(
@@ -393,16 +393,16 @@ void search(raft::resources const& res,
   } catch (const std::bad_cast&) {
   }
 
-  // try {
-  //   auto& sample_filter =
-  //     dynamic_cast<const cuvs::neighbors::filtering::cagra_filter&>(
-  //       sample_filter_ref);
-  //   auto sample_filter_copy = sample_filter;
-  //   return search_with_filtering<T, IdxT, decltype(sample_filter_copy)>(
-  //     res, params, idx, queries, neighbors, distances, sample_filter_copy);
-  // } catch (const std::bad_cast&) {
-  //   RAFT_FAIL("Unsupported sample filter type");
-  // }
+  try {
+    using range_filter_type = cuvs::neighbors::filtering::range_filter;
+    auto& sample_filter     = dynamic_cast<const range_filter_type&>(sample_filter_ref);
+    auto sample_filter_copy = sample_filter;
+    return search_with_filtering<T, IdxT, range_filter_type>(
+      res, params, idx, queries, neighbors, distances, sample_filter_copy);
+  } catch (const std::bad_cast&) {
+  }
+
+  RAFT_FAIL("Unsupported sample filter type");
 }
 
 template <typename T, typename IdxT>

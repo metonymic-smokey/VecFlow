@@ -81,6 +81,7 @@ __global__ void classify_queries_kernel(const T* queries,
   if (tid >= n_queries) return;
 
   uint32_t label = query_labels[tid];
+  // if given a threshold for range labels,   
   uint32_t freq = cat_freq[label];
   bool is_cagra = freq > specificity_threshold;
   

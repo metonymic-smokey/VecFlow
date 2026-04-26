@@ -245,7 +245,7 @@ int main() {
   // Create input arrays.
   int64_t n_samples = 1000000;
   int64_t n_dim = 128;
-  int64_t n_queries = 100000;
+  int64_t n_queries = 5000;
   auto dataset =
       raft::make_device_matrix<float, int64_t>(res, n_samples, n_dim);
   auto queries =

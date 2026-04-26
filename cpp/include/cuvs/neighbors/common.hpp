@@ -527,6 +527,22 @@ inline _RAFT_HOST_DEVICE bool cagra_filter::operator()(
   return false;
 }
 
+struct range_filter : public base_filter {
+  const uint32_t* data_labels_;
+  const uint32_t* query_low_;
+  const uint32_t* query_high_;
+
+  range_filter(const uint32_t* data_labels,
+               const uint32_t* query_low,
+               const uint32_t* query_high)
+    : data_labels_(data_labels), query_low_(query_low), query_high_(query_high) {}
+
+  inline _RAFT_HOST_DEVICE bool operator()(uint32_t query_ix, uint32_t sample_ix) const {
+    uint32_t val = data_labels_[sample_ix];
+    return val >= query_low_[query_ix] && val <= query_high_[query_ix];
+  }
+};
+
 /**
  * If the filtering depends on the index of a sample, then the following
  * filter template can be used:

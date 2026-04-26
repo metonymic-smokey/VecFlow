@@ -107,8 +107,10 @@ int main(int argc, char** argv) {
 	shared_resources::configured_raft_resources res;
 
 	auto dataset = raft::make_device_matrix<float, int64_t>(res, N, dim);
+	// allocate an array on GPU memory. 
 	auto queries = raft::make_device_matrix<float, int64_t>(res, Nq, dim);
 	raft::copy(dataset.data_handle(), h_data.data(), h_data.size(), raft::resource::get_cuda_stream(res));
+	// asynchronous copy using a CUDA stream.
 	raft::copy(queries.data_handle(), h_queries.data(), h_queries.size(), raft::resource::get_cuda_stream(res));
 
 	std::vector<uint32_t> h_query_labels(Nq);
@@ -121,7 +123,7 @@ int main(int argc, char** argv) {
 
 	// Build VecFlow index
 	auto idx = vecflow::build(res,
-														raft::make_const_mdspan(dataset.view()),
+														raft::make_const_mdspan(dataset.view()), // read only view.  
 														data_label_vecs,
 														graph_degree,
 														specificity_threshold,

@@ -211,6 +211,70 @@ void create_bitmap_filter_fast(raft::resources const& handle,
   raft::resource::sync_stream(handle); // Wait for kernel completion
 }
 
+void generate_range_ground_truth(
+    raft::resources const& res,
+    raft::device_matrix_view<const float, int64_t> dataset,
+    raft::device_matrix_view<const float, int64_t> queries,
+    const std::vector<uint32_t>& data_labels_h,
+    const std::vector<uint32_t>& query_low_h,
+    const std::vector<uint32_t>& query_high_h,
+    raft::device_matrix_view<uint32_t, int64_t> gt_neighbors,
+    std::string& gt_fname) {
+
+  std::ifstream file(gt_fname);
+  if (file.good()) {
+    load_matrix_from_ibin(res, gt_fname, gt_neighbors);
+    return;
+  }
+
+  int64_t n_queries  = queries.extent(0);
+  int64_t n_database = dataset.extent(0);
+  int64_t words_per_row = (n_database + 31) / 32;
+
+  // Pre-sort data indices by label for fast range lookup
+  std::vector<uint32_t> sorted_idx(n_database);
+  std::iota(sorted_idx.begin(), sorted_idx.end(), 0);
+  std::sort(sorted_idx.begin(), sorted_idx.end(),
+            [&](uint32_t a, uint32_t b) { return data_labels_h[a] < data_labels_h[b]; });
+  std::vector<uint32_t> sorted_labels(n_database);
+  for (int64_t i = 0; i < n_database; i++) sorted_labels[i] = data_labels_h[sorted_idx[i]];
+
+  auto bitmap = raft::make_device_matrix<uint32_t, int64_t>(res, n_queries, words_per_row);
+  RAFT_CUDA_TRY(cudaMemsetAsync(bitmap.data_handle(), 0,
+    bitmap.size() * sizeof(uint32_t), raft::resource::get_cuda_stream(res)));
+
+  for (int64_t q = 0; q < n_queries; q++) {
+    uint32_t lo = query_low_h[q], hi = query_high_h[q];
+    auto beg = std::lower_bound(sorted_labels.begin(), sorted_labels.end(), lo);
+    auto end = std::upper_bound(sorted_labels.begin(), sorted_labels.end(), hi);
+    std::vector<uint32_t> h_bits(words_per_row, 0);
+    for (auto it = beg; it != end; ++it) {
+      uint32_t d = sorted_idx[it - sorted_labels.begin()];
+      h_bits[d / 32] |= (1u << (d % 32));
+    }
+    raft::update_device(bitmap.data_handle() + q * words_per_row,
+                        h_bits.data(), words_per_row,
+                        raft::resource::get_cuda_stream(res));
+  }
+
+  auto bf_index = cuvs::neighbors::brute_force::build(res, dataset,
+                                                       cuvs::distance::DistanceType::L2Expanded);
+  auto bitmap_view = raft::core::bitmap_view<const uint32_t, int64_t>(
+    bitmap.data_handle(), n_queries, n_database);
+  auto filter = cuvs::neighbors::filtering::bitmap_filter<const uint32_t, int64_t>(bitmap_view);
+  auto temp_neighbors = raft::make_device_matrix<int64_t, int64_t>(
+    res, n_queries, gt_neighbors.extent(1));
+  auto gt_distances = raft::make_device_matrix<float, int64_t>(
+    res, n_queries, gt_neighbors.extent(1));
+  cuvs::neighbors::brute_force::search(res, bf_index, queries,
+    temp_neighbors.view(), gt_distances.view(), filter);
+  raft::resource::sync_stream(res);
+  convert_neighbors_to_uint32(res, temp_neighbors.data_handle(),
+    gt_neighbors.data_handle(), n_queries, gt_neighbors.extent(1));
+  save_matrix_to_ibin(res, gt_fname, gt_neighbors);
+  std::cout << "Generated range ground truth for " << n_queries << " queries" << std::endl;
+}
+
 // Function for CAGRA search with inline filtering
 double cagra_search_inline_filtering(shared_resources::configured_raft_resources& dev_resources,
                                      cagra::index<float, uint32_t>& cagra_index,
@@ -274,6 +338,47 @@ double cagra_search_inline_filtering(shared_resources::configured_raft_resources
   double qps = num_runs * n_queries / total_time;
 
   return qps;
+}
+
+double cagra_search_range_filtering(
+    shared_resources::configured_raft_resources& dev_resources,
+    cagra::index<float, uint32_t>& cagra_index,
+    const raft::device_matrix_view<const float, int64_t>& queries,
+    const raft::device_vector_view<const uint32_t, int64_t>& d_data_labels,
+    const raft::device_vector_view<const uint32_t, int64_t>& d_query_low,
+    const raft::device_vector_view<const uint32_t, int64_t>& d_query_high,
+    int itopk_size,
+    int topk,
+    int num_runs,
+    int warmup_runs,
+    raft::device_matrix_view<uint32_t, int64_t> neighbors) {
+
+  int64_t n_queries = queries.extent(0);
+  cagra::search_params search_params;
+  search_params.itopk_size = itopk_size;
+
+  auto distances = raft::make_device_matrix<float, int64_t>(dev_resources, n_queries, topk);
+  auto filter = cuvs::neighbors::filtering::range_filter(
+    d_data_labels.data_handle(),
+    d_query_low.data_handle(),
+    d_query_high.data_handle());
+
+  for (int i = 0; i < warmup_runs; i++) {
+    cagra::search(dev_resources, search_params, cagra_index,
+                  queries, neighbors, distances.view(), filter);
+  }
+  raft::resource::sync_stream(dev_resources);
+
+  auto start = std::chrono::high_resolution_clock::now();
+  for (int i = 0; i < num_runs; i++) {
+    cagra::search(dev_resources, search_params, cagra_index,
+                  queries, neighbors, distances.view(), filter);
+  }
+  raft::resource::sync_stream(dev_resources);
+  auto end = std::chrono::high_resolution_clock::now();
+
+  double total_time = std::chrono::duration<double>(end - start).count();
+  return num_runs * n_queries / total_time;
 }
 
 double cagra_search_with_post_processing(shared_resources::configured_raft_resources& dev_resources,
@@ -412,6 +517,8 @@ int main(int argc, char** argv) {
 	bool force_rebuild = false;
 	std::vector<std::string> algorithms_to_run;
 	std::string output_json_file;
+	uint32_t range_delta = 500;
+	std::string range_ground_truth_fname = "range_gt.10.ibin";
 
 	// Load configuration from file
 	std::ifstream file(config_file);
@@ -447,6 +554,9 @@ int main(int argc, char** argv) {
 		// Load new parameters
 		algorithms_to_run = config["algorithms_to_run"].get<std::vector<std::string>>();
 		output_json_file = config["output_json_file"];
+		if (config.contains("range_delta")) range_delta = config["range_delta"];
+		if (config.contains("range_ground_truth_fname"))
+			range_ground_truth_fname = config["range_ground_truth_fname"];
 
 	} catch (const std::exception& e) {
 		fprintf(stderr, "Error parsing JSON config file: %s\n", e.what());
@@ -635,6 +745,63 @@ int main(int argc, char** argv) {
                               {"qps", qps},
                               {"recall", recall}});
     }
+	}
+
+	// CAGRA Range Filtering
+	if (std::find(algorithms_to_run.begin(), algorithms_to_run.end(), "cagra_range_filtering") != algorithms_to_run.end()) {
+		printf("\n=== Building CAGRA Index (for Range Filtering) ===\n");
+		build_cagra_index(res, cagra_index, raft::make_const_mdspan(d_data.view()),
+		                  full_cagra_index_fname, graph_degree);
+
+		// Build per-vector label array (first label per vector)
+		std::vector<uint32_t> h_data_labels(N);
+		for (uint32_t i = 0; i < N; i++)
+			h_data_labels[i] = data_label_vecs[i].empty() ? 0 : static_cast<uint32_t>(data_label_vecs[i][0]);
+
+		// Build per-query range bounds: [label - delta, label + delta]
+		std::vector<uint32_t> h_query_low(Nq), h_query_high(Nq);
+		for (uint32_t i = 0; i < Nq; i++) {
+			uint32_t lbl = h_query_labels[i];
+			h_query_low[i]  = lbl >= range_delta ? lbl - range_delta : 0;
+			h_query_high[i] = lbl + range_delta;
+		}
+
+		// Copy to device
+		auto d_data_labels  = raft::make_device_vector<uint32_t, int64_t>(res, N);
+		auto d_query_low    = raft::make_device_vector<uint32_t, int64_t>(res, Nq);
+		auto d_query_high   = raft::make_device_vector<uint32_t, int64_t>(res, Nq);
+		raft::copy(d_data_labels.data_handle(),  h_data_labels.data(),  N,  stream);
+		raft::copy(d_query_low.data_handle(),    h_query_low.data(),    Nq, stream);
+		raft::copy(d_query_high.data_handle(),   h_query_high.data(),   Nq, stream);
+		raft::resource::sync_stream(res);
+
+		// Generate range ground truth
+		std::string full_range_gt_fname = data_dir + range_ground_truth_fname;
+		auto range_gt = raft::make_device_matrix<uint32_t, int64_t>(res, Nq, topk);
+		generate_range_ground_truth(res,
+		  raft::make_const_mdspan(d_data.view()),
+		  raft::make_const_mdspan(d_queries.view()),
+		  h_data_labels, h_query_low, h_query_high,
+		  range_gt.view(), full_range_gt_fname);
+
+		printf("\n=== CAGRA Search with Range Filtering Benchmarking (delta=%u) ===\n", range_delta);
+		auto range_neighbors = raft::make_device_matrix<uint32_t, int64_t>(res, Nq, topk);
+		for (int current_itopk : itopk_sizes) {
+			printf("-- Running CAGRA Range Filter (itopk=%d) --\n", current_itopk);
+			double qps = cagra_search_range_filtering(res, cagra_index,
+			  raft::make_const_mdspan(d_queries.view()),
+			  raft::make_const_mdspan(d_data_labels.view()),
+			  raft::make_const_mdspan(d_query_low.view()),
+			  raft::make_const_mdspan(d_query_high.view()),
+			  current_itopk, topk, num_runs, warmup_runs, range_neighbors.view());
+			double recall = compute_recall(res, range_neighbors.view(), range_gt.view());
+			printf("  - QPS: %.2f, Recall@%d: %.4f\n", qps, topk, recall);
+			results_json.push_back({{"algorithm", "cagra_range_filtering"},
+			                        {"itopk", current_itopk},
+			                        {"delta", range_delta},
+			                        {"qps", qps},
+			                        {"recall", recall}});
+		}
 	}
 
 	// --- Write Results to JSON ---

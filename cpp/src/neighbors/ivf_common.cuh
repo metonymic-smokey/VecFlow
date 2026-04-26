@@ -277,7 +277,7 @@ template <typename Index>
 void recompute_internal_state(const raft::resources& res, Index& index)
 {
   auto stream  = raft::resource::get_cuda_stream(res);
-  auto tmp_res = raft::resource::get_workspace_resource(res);
+  auto tmp_res = raft::resource::get_workspace_resource(res); // temp alloc'ed scratch space.
   rmm::device_uvector<uint32_t> sorted_sizes(index.n_lists(), stream, tmp_res);
 
   // Actualize the list pointers
@@ -313,6 +313,7 @@ void recompute_internal_state(const raft::resources& res, Index& index)
                                            end_bit,
                                            stream);
   // copy the results to CPU
+  // anything host always means CPU!
   std::vector<uint32_t> sorted_sizes_host(index.n_lists());
   raft::copy(sorted_sizes_host.data(), sorted_sizes.data(), index.n_lists(), stream);
   raft::resource::sync_stream(res);

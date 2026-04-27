@@ -340,6 +340,97 @@ double cagra_search_inline_filtering(shared_resources::configured_raft_resources
   return qps;
 }
 
+__global__ void range_filter_neighbors_kernel(
+    const uint32_t* neighbors,
+    const uint32_t* data_labels,
+    const uint32_t* query_low,
+    const uint32_t* query_high,
+    uint32_t* filtered_neighbors,
+    int64_t n_queries,
+    int64_t itopk_size,
+    int64_t topk,
+    int64_t n_vectors)
+{
+  int query_idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (query_idx >= n_queries) return;
+
+  uint32_t lo = query_low[query_idx];
+  uint32_t hi = query_high[query_idx];
+  int filtered_count = 0;
+
+  for (int j = 0; j < itopk_size && filtered_count < topk; ++j) {
+    uint32_t neighbor_idx = neighbors[query_idx * itopk_size + j];
+    if (neighbor_idx == UINT32_MAX || neighbor_idx >= (uint32_t)n_vectors) continue;
+    uint32_t val = data_labels[neighbor_idx];
+    if (val >= lo && val <= hi)
+      filtered_neighbors[query_idx * topk + filtered_count++] = neighbor_idx;
+  }
+  while (filtered_count < topk)
+    filtered_neighbors[query_idx * topk + filtered_count++] = UINT32_MAX;
+}
+
+// CAGRA search + range post-processing:
+// run unfiltered CAGRA for itopk_size candidates, then filter by range on GPU
+double cagra_search_range_post_processing(
+    shared_resources::configured_raft_resources& dev_resources,
+    cagra::index<float, uint32_t>& cagra_index,
+    const raft::device_matrix_view<const float, int64_t>& queries,
+    const raft::device_vector_view<const uint32_t, int64_t>& d_data_labels,
+    const raft::device_vector_view<const uint32_t, int64_t>& d_query_low,
+    const raft::device_vector_view<const uint32_t, int64_t>& d_query_high,
+    int itopk_size,
+    int topk,
+    int num_runs,
+    int warmup_runs,
+    raft::device_matrix_view<uint32_t, int64_t> filtered_neighbors)
+{
+  auto stream = raft::resource::get_cuda_stream(dev_resources);
+  int64_t n_queries = queries.extent(0);
+  int64_t n_vectors = cagra_index.size();
+
+  cagra::search_params search_params;
+  search_params.itopk_size = itopk_size;
+
+  // CAGRA returns itopk_size unfiltered candidates
+  auto cagra_neighbors = raft::make_device_matrix<uint32_t, int64_t>(dev_resources, n_queries, itopk_size);
+  auto cagra_distances = raft::make_device_matrix<float, int64_t>(dev_resources, n_queries, itopk_size);
+
+  int block_size = 256;
+  int grid_size  = (n_queries + block_size - 1) / block_size;
+
+  for (int i = 0; i < warmup_runs; i++) {
+    cagra::search(dev_resources, search_params, cagra_index,
+                  queries, cagra_neighbors.view(), cagra_distances.view());
+    range_filter_neighbors_kernel<<<grid_size, block_size, 0, stream>>>(
+        cagra_neighbors.data_handle(),
+        d_data_labels.data_handle(),
+        d_query_low.data_handle(),
+        d_query_high.data_handle(),
+        filtered_neighbors.data_handle(),
+        n_queries, itopk_size, topk, n_vectors);
+    raft::resource::sync_stream(dev_resources);
+  }
+
+  auto start = std::chrono::high_resolution_clock::now();
+  for (int i = 0; i < num_runs; i++) {
+    cagra::search(dev_resources, search_params, cagra_index,
+                  queries, cagra_neighbors.view(), cagra_distances.view());
+    range_filter_neighbors_kernel<<<grid_size, block_size, 0, stream>>>(
+        cagra_neighbors.data_handle(),
+        d_data_labels.data_handle(),
+        d_query_low.data_handle(),
+        d_query_high.data_handle(),
+        filtered_neighbors.data_handle(),
+        n_queries, itopk_size, topk, n_vectors);
+    raft::resource::sync_stream(dev_resources);
+  }
+  raft::resource::sync_stream(dev_resources);
+  auto end = std::chrono::high_resolution_clock::now();
+
+  double total_time = std::chrono::duration<double>(end - start).count();
+  return num_runs * n_queries / total_time;
+}
+
 double cagra_search_range_filtering(
     shared_resources::configured_raft_resources& dev_resources,
     cagra::index<float, uint32_t>& cagra_index,
@@ -803,6 +894,59 @@ int main(int argc, char** argv) {
 			                        {"recall", recall}});
 		}
 	}
+
+	// CAGRA Range Post-Processing
+if (std::find(algorithms_to_run.begin(), algorithms_to_run.end(), "cagra_range_post_processing") != algorithms_to_run.end()) {
+    printf("\n=== Building CAGRA Index (for Range Post-Processing) ===\n");
+    build_cagra_index(res, cagra_index, raft::make_const_mdspan(d_data.view()),
+                      full_cagra_index_fname, graph_degree);
+
+    std::vector<uint32_t> h_data_labels_rpp(N);
+    for (uint32_t i = 0; i < N; i++)
+        h_data_labels_rpp[i] = data_label_vecs[i].empty() ? 0 : static_cast<uint32_t>(data_label_vecs[i][0]);
+
+    std::vector<uint32_t> h_query_low_rpp(Nq), h_query_high_rpp(Nq);
+    for (uint32_t i = 0; i < Nq; i++) {
+        uint32_t lbl = h_query_labels[i];
+        h_query_low_rpp[i]  = lbl >= range_delta ? lbl - range_delta : 0;
+        h_query_high_rpp[i] = lbl + range_delta;
+    }
+
+    auto d_data_labels_rpp = raft::make_device_vector<uint32_t, int64_t>(res, N);
+    auto d_query_low_rpp   = raft::make_device_vector<uint32_t, int64_t>(res, Nq);
+    auto d_query_high_rpp  = raft::make_device_vector<uint32_t, int64_t>(res, Nq);
+    raft::copy(d_data_labels_rpp.data_handle(), h_data_labels_rpp.data(), N,  stream);
+    raft::copy(d_query_low_rpp.data_handle(),   h_query_low_rpp.data(),   Nq, stream);
+    raft::copy(d_query_high_rpp.data_handle(),  h_query_high_rpp.data(),  Nq, stream);
+    raft::resource::sync_stream(res);
+
+    std::string full_range_gt_fname_rpp = data_dir + range_ground_truth_fname;
+    auto range_gt_rpp = raft::make_device_matrix<uint32_t, int64_t>(res, Nq, topk);
+    generate_range_ground_truth(res,
+        raft::make_const_mdspan(d_data.view()),
+        raft::make_const_mdspan(d_queries.view()),
+        h_data_labels_rpp, h_query_low_rpp, h_query_high_rpp,
+        range_gt_rpp.view(), full_range_gt_fname_rpp);
+
+    printf("\n=== CAGRA Range Post-Processing Benchmarking (delta=%u) ===\n", range_delta);
+    auto range_pp_neighbors = raft::make_device_matrix<uint32_t, int64_t>(res, Nq, topk);
+    for (int current_itopk : itopk_sizes) {
+        printf("-- Running CAGRA Range Post-Processing (itopk=%d) --\n", current_itopk);
+        double qps = cagra_search_range_post_processing(res, cagra_index,
+            raft::make_const_mdspan(d_queries.view()),
+            raft::make_const_mdspan(d_data_labels_rpp.view()),
+            raft::make_const_mdspan(d_query_low_rpp.view()),
+            raft::make_const_mdspan(d_query_high_rpp.view()),
+            current_itopk, topk, num_runs, warmup_runs, range_pp_neighbors.view());
+        double recall = compute_recall(res, range_pp_neighbors.view(), range_gt_rpp.view());
+        printf("  - QPS: %.2f, Recall@%d: %.4f\n", qps, topk, recall);
+        results_json.push_back({{"algorithm", "cagra_range_post_processing"},
+                                {"itopk", current_itopk},
+                                {"delta", range_delta},
+                                {"qps", qps},
+                                {"recall", recall}});
+    }
+}
 
 	// --- Write Results to JSON ---
 	printf("\nWriting results to %s\n", output_json_file.c_str());
